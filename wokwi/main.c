@@ -1,36 +1,38 @@
 /**
- * @file    main.c  (Wokwi 版 — STM32 Nucleo-64 C031C6)
- * @brief   STM32 命令行控制系统，适配 Wokwi C031C6 仿真
+ * @file    main.c  (Wokwi — STM32 Nucleo-64 C031C6 + Arduino STM32 框架)
  *
  * 使用方法：
- *   1. 在 Wokwi 点击 "STM32 Nucleo-64 C031C6" 新建项目
- *   2. 将本文件内容粘贴到 main.c
- *   3. 将 diagram.json 内容粘贴到 diagram.json 标签
- *   4. 点击 ▶ 运行，在 Serial Monitor 输入命令
+ *   1. Wokwi 新建 C031C6 项目，粘贴本文件到 main.c，diagram.json 粘贴同目录文件
+ *   2. 点 ▶ 运行，在 Serial Monitor 输入命令
  *
- * 引脚映射（C031C6 Nucleo-64）：
- *   PA5  - LED1（板载 LD2，高电平点亮）
- *   PB0  - LED2（绿色）
- *   PB1  - LED3（蓝色）
- *   PA8  - TIM1_CH1 PWM（黄色 LED，亮度随占空比变化）
- *   PA9  - USART1_TX → Serial Monitor
- *   PA10 - USART1_RX ← Serial Monitor
+ * 引脚（与 diagram.json 一致）：
+ *   PA5  - LED1 板载 LD2（高电平亮）
+ *   PB0  - LED2 绿色
+ *   PB1  - LED3 蓝色
+ *   PA8  - TIM1_CH1 PWM（黄色 LED）
+ *   PA2  - USART2_TX → Serial Monitor RX
+ *   PA3  - USART2_RX ← Serial Monitor TX
+ *
+ * 注意：Wokwi C031C6 使用 Arduino STM32 框架编译，因此：
+ *   - 用 setup()/loop() 替代 main()
+ *   - Error_Handler 是框架宏，需要先 #undef
+ *   - 串口监视器默认接 PA2/PA3 (USART2)
  */
 
 #include "stm32c0xx_hal.h"
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdio.h>
 
 /* ===== 配置 ===== */
-#define CMD_BUF_SIZE     64
-#define RESP_BUF_SIZE    256
-#define LED_COUNT        3
-#define UART_BAUD        115200
-#define HISTORY_SIZE     8
-#define PROMPT_STR       "stm32> "
-#define PROMPT_LEN       7
+#define CMD_BUF_SIZE  64
+#define RESP_BUF_SIZE 256
+#define LED_COUNT     3
+#define UART_BAUD     115200
+#define HISTORY_SIZE  8
+#define PROMPT_STR    "stm32> "
+#define PROMPT_LEN    7
 
 typedef enum { LED_MODE_OFF = 0, LED_MODE_ON, LED_MODE_BLINK } LedMode_t;
 
@@ -44,14 +46,13 @@ typedef struct {
 } Led_t;
 
 /* ===== 全局变量 ===== */
-UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;   /* USART2: PA2(TX) / PA3(RX) — Wokwi Serial Monitor */
 TIM_HandleTypeDef  htim1;
 
-/* C031C6 Nucleo-64: LED1 = PA5 (LD2, 高电平亮), LED2/3 = PB0/PB1 */
 static Led_t g_leds[LED_COUNT] = {
-    { GPIOA, GPIO_PIN_5, LED_MODE_OFF, 0, 0, 0 },
-    { GPIOB, GPIO_PIN_0, LED_MODE_OFF, 0, 0, 0 },
-    { GPIOB, GPIO_PIN_1, LED_MODE_OFF, 0, 0, 0 },
+    { GPIOA, GPIO_PIN_5, LED_MODE_OFF, 0, 0, 0 },  /* LED1: PA5 板载 LD2 */
+    { GPIOB, GPIO_PIN_0, LED_MODE_OFF, 0, 0, 0 },  /* LED2: PB0 */
+    { GPIOB, GPIO_PIN_1, LED_MODE_OFF, 0, 0, 0 },  /* LED3: PB1 */
 };
 
 static char cmd_buf[CMD_BUF_SIZE];
@@ -70,9 +71,8 @@ static int8_t  g_hist_pos   = -1;
 static volatile uint8_t g_esc_state = 0;
 
 /* ===== 前向声明 ===== */
-void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void uart_print(const char *fmt, ...);
 static void process_command(char *cmd);
@@ -85,7 +85,7 @@ static void cmd_pwm(int argc, char *argv[]);
 static void cmd_uptime(int argc, char *argv[]);
 static void cmd_reset(int argc, char *argv[]);
 static void cmd_stats(int argc, char *argv[]);
-static void cmd_history(int argc, char *argv[]);
+static void cmd_history_cmd(int argc, char *argv[]);
 static void       history_push(const char *s, uint16_t len);
 static const char *history_get(int8_t offset);
 static void       isr_replace_line(const char *s, uint16_t len);
@@ -97,30 +97,29 @@ typedef struct {
 } Command_t;
 
 static const Command_t cmd_table[] = {
-    { "help",    cmd_help,    "Show all commands" },
-    { "led",     cmd_led,     "led <on|off|blink|status> <id> [ms]" },
-    { "pwm",     cmd_pwm,     "pwm <id> <duty 0-100>" },
-    { "uptime",  cmd_uptime,  "Show system uptime" },
-    { "stats",   cmd_stats,   "Show command statistics" },
-    { "history", cmd_history, "Show command history (up/down arrows)" },
-    { "reset",   cmd_reset,   "Soft reset" },
+    { "help",    cmd_help,        "Show all commands" },
+    { "led",     cmd_led,         "led <on|off|blink|status> <id> [ms]" },
+    { "pwm",     cmd_pwm,         "pwm <id> <duty 0-100>" },
+    { "uptime",  cmd_uptime,      "Show system uptime" },
+    { "stats",   cmd_stats,       "Show command statistics" },
+    { "history", cmd_history_cmd, "Show command history (up/down arrows)" },
+    { "reset",   cmd_reset,       "Soft reset" },
     { NULL, NULL, NULL }
 };
 
-/* ===== main ===== */
-int main(void)
+/* ===== Arduino 入口：setup() 替代 main() 初始化 ===== */
+void setup(void)
 {
-    HAL_Init();
-    SystemClock_Config();
+    /* Arduino STM32 框架已调用 HAL_Init()，这里只初始化外设 */
     MX_GPIO_Init();
-    MX_USART1_UART_Init();
+    MX_USART2_UART_Init();
     MX_TIM1_Init();
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
     for (int i = 0; i < LED_COUNT; i++) led_set(i, 0);
 
     g_start_tick = HAL_GetTick();
-    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
 
     uart_print("\r\n");
     uart_print("=====================================\r\n");
@@ -128,52 +127,52 @@ int main(void)
     uart_print(" Type 'help' for command list\r\n");
     uart_print("=====================================\r\n");
     show_prompt();
-
-    while (1) {
-        if (cmd_ready) {
-            process_command(cmd_buf);
-            cmd_len = 0;
-            cmd_ready = 0;
-            show_prompt();
-        }
-        update_leds();
-    }
 }
 
-/* ===== HAL MSP：USART1 引脚 + 中断 ===== */
+/* ===== Arduino 入口：loop() 替代 while(1) ===== */
+void loop(void)
+{
+    if (cmd_ready) {
+        process_command(cmd_buf);
+        cmd_len   = 0;
+        cmd_ready = 0;
+        show_prompt();
+    }
+    update_leds();
+}
+
+/* ===== HAL MSP：USART2 引脚（PA2 TX / PA3 RX） ===== */
 void HAL_UART_MspInit(UART_HandleTypeDef *huart)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    if (huart->Instance == USART1) {
-        __HAL_RCC_USART1_CLK_ENABLE();
+    if (huart->Instance == USART2) {
+        __HAL_RCC_USART2_CLK_ENABLE();
         __HAL_RCC_GPIOA_CLK_ENABLE();
 
-        GPIO_InitStruct.Pin       = GPIO_PIN_9;         /* TX */
+        GPIO_InitStruct.Pin       = GPIO_PIN_2;         /* PA2: TX */
         GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull      = GPIO_NOPULL;
         GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
-        GPIO_InitStruct.Alternate = GPIO_AF1_USART1;
+        GPIO_InitStruct.Alternate = GPIO_AF1_USART2;
         HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-        GPIO_InitStruct.Pin       = GPIO_PIN_10;        /* RX */
-        GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
-        GPIO_InitStruct.Alternate = GPIO_AF1_USART1;
+        GPIO_InitStruct.Pin       = GPIO_PIN_3;         /* PA3: RX */
+        GPIO_InitStruct.Alternate = GPIO_AF1_USART2;
         HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-        HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
-        HAL_NVIC_EnableIRQ(USART1_IRQn);
+        HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
+        HAL_NVIC_EnableIRQ(USART2_IRQn);
     }
 }
 
 /* ===== HAL MSP：TIM1 时钟 ===== */
 void HAL_TIM_Base_MspInit(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM1) {
+    if (htim->Instance == TIM1)
         __HAL_RCC_TIM1_CLK_ENABLE();
-    }
 }
 
-/* ===== HAL MSP 后处理：TIM1_CH1 → PA8 ===== */
+/* ===== HAL MSP 后处理：PA8 → TIM1_CH1 PWM ===== */
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -188,19 +187,19 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim)
     }
 }
 
-/* ===== USART1 中断入口 ===== */
-void USART1_IRQHandler(void)
+/* ===== USART2 中断入口 ===== */
+void USART2_IRQHandler(void)
 {
-    HAL_UART_IRQHandler(&huart1);
+    HAL_UART_IRQHandler(&huart2);
 }
 
 /* ===== UART 接收回调 ===== */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance != USART1) return;
+    if (huart->Instance != USART2) return;
 
     if (cmd_ready) {
-        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
         return;
     }
 
@@ -208,7 +207,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
     if (g_esc_state == 1) {
         g_esc_state = (b == '[') ? 2 : 0;
-        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
         return;
     }
     if (g_esc_state == 2) {
@@ -239,7 +238,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 }
             }
         }
-        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
         return;
     }
 
@@ -247,25 +246,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         g_esc_state = 1;
     } else if (b == 0x03) {
         cmd_len = 0; cmd_buf[0] = '\0'; g_hist_pos = -1;
-        HAL_UART_Transmit(&huart1, (uint8_t *)"^C\r\n" PROMPT_STR, 4 + PROMPT_LEN, 20);
+        HAL_UART_Transmit(&huart2, (uint8_t *)"^C\r\n" PROMPT_STR, 4 + PROMPT_LEN, 20);
     } else if (b == '\r' || b == '\n') {
         if (cmd_len > 0) {
             cmd_buf[cmd_len] = '\0';
             history_push(cmd_buf, cmd_len);
             cmd_ready = 1;
         }
-        HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 10);
+        HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, 10);
     } else if (b == 0x08 || b == 0x7F) {
         if (cmd_len > 0) {
             cmd_len--;
-            HAL_UART_Transmit(&huart1, (uint8_t *)"\b \b", 3, 10);
+            HAL_UART_Transmit(&huart2, (uint8_t *)"\b \b", 3, 10);
         }
     } else if (cmd_len < CMD_BUF_SIZE - 1 && b >= 0x20 && b < 0x7F) {
         g_hist_pos = -1;
         cmd_buf[cmd_len++] = b;
-        HAL_UART_Transmit(&huart1, &b, 1, 10);
+        HAL_UART_Transmit(&huart2, &b, 1, 10);
     }
-    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
 }
 
 /* ===== UART 工具 ===== */
@@ -276,7 +275,7 @@ static void uart_print(const char *fmt, ...)
     va_start(args, fmt);
     int len = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    if (len > 0) HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 100);
+    if (len > 0) HAL_UART_Transmit(&huart2, (uint8_t *)buf, len, 100);
 }
 
 static void show_prompt(void) { uart_print(PROMPT_STR); }
@@ -346,9 +345,9 @@ static void cmd_led(int argc, char *argv[])
         if (period < 10 || period > 60000) {
             uart_print("Error: period must be 10-60000 ms\r\n"); return;
         }
-        g_leds[id].mode           = LED_MODE_BLINK;
+        g_leds[id].mode            = LED_MODE_BLINK;
         g_leds[id].blink_period_ms = period;
-        g_leds[id].next_toggle    = HAL_GetTick() + period;
+        g_leds[id].next_toggle     = HAL_GetTick() + period;
         uart_print("LED%d BLINK %d ms\r\n", id + 1, period);
     } else {
         uart_print("Error: unknown action '%s'\r\n", argv[1]);
@@ -359,7 +358,7 @@ static void cmd_pwm(int argc, char *argv[])
 {
     if (argc < 3) { uart_print("Usage: pwm <id> <duty 0-100>\r\n"); return; }
     int id = atoi(argv[1]), duty = atoi(argv[2]);
-    if (id != 1) { uart_print("Error: only PWM 1 is supported\r\n"); return; }
+    if (id != 1)           { uart_print("Error: only PWM 1 is supported\r\n"); return; }
     if (duty < 0 || duty > 100) { uart_print("Error: duty must be 0-100\r\n"); return; }
     uint32_t ccr = (htim1.Init.Period + 1) * duty / 100;
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr);
@@ -408,11 +407,11 @@ static const char *history_get(int8_t offset)
 
 static void isr_replace_line(const char *s, uint16_t len)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *)"\r\x1b[2K" PROMPT_STR, 5 + PROMPT_LEN, 20);
-    if (len > 0) HAL_UART_Transmit(&huart1, (uint8_t *)s, len, 50);
+    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\x1b[2K" PROMPT_STR, 5 + PROMPT_LEN, 20);
+    if (len > 0) HAL_UART_Transmit(&huart2, (uint8_t *)s, len, 50);
 }
 
-static void cmd_history(int argc, char *argv[])
+static void cmd_history_cmd(int argc, char *argv[])
 {
     __disable_irq();
     uint8_t cnt = g_hist_count, head = g_hist_head;
@@ -443,38 +442,14 @@ static void update_leds(void)
     }
 }
 
-/* ===== 初始化函数 ===== */
-
-/**
- * C031C6 HSI 内置振荡器 = 48 MHz，直接作为 SYSCLK，无需 PLL。
- */
-void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
-    RCC_OscInitStruct.HSIDiv              = RCC_HSI_DIV1;   /* 48MHz ÷ 1 = 48MHz */
-    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    HAL_RCC_OscConfig(&RCC_OscInitStruct);
-
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                                     | RCC_CLOCKTYPE_PCLK1;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_HSI;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
-}
-
+/* ===== 外设初始化 ===== */
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* PA5 - LED1 LD2，初始低（灭） */
+    /* PA5 - LED1 (LD2)，初始低（灭） */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
     GPIO_InitStruct.Pin   = GPIO_PIN_5;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -491,17 +466,17 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
-static void MX_USART1_UART_Init(void)
+static void MX_USART2_UART_Init(void)
 {
-    huart1.Instance          = USART1;
-    huart1.Init.BaudRate     = UART_BAUD;
-    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits     = UART_STOPBITS_1;
-    huart1.Init.Parity       = UART_PARITY_NONE;
-    huart1.Init.Mode         = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
-    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-    HAL_UART_Init(&huart1);
+    huart2.Instance          = USART2;
+    huart2.Init.BaudRate     = UART_BAUD;
+    huart2.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits     = UART_STOPBITS_1;
+    huart2.Init.Parity       = UART_PARITY_NONE;
+    huart2.Init.Mode         = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+    HAL_UART_Init(&huart2);
 }
 
 static void MX_TIM1_Init(void)
@@ -510,7 +485,7 @@ static void MX_TIM1_Init(void)
     TIM_MasterConfigTypeDef sMasterConfig      = {0};
     TIM_OC_InitTypeDef      sConfigOC          = {0};
 
-    /* C031C6 SYSCLK = 48MHz；48MHz / 48 = 1MHz 计数时钟，ARR=999 → 1kHz PWM */
+    /* C031C6 SYSCLK = 48MHz；48/48 = 1MHz 计数时钟，ARR=999 → 1kHz PWM */
     htim1.Instance               = TIM1;
     htim1.Init.Prescaler         = 47;
     htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
@@ -537,6 +512,10 @@ static void MX_TIM1_Init(void)
     HAL_TIM_MspPostInit(&htim1);
 }
 
+/* ===== Error_Handler（先取消框架宏定义，再声明我们的版本） ===== */
+#ifdef Error_Handler
+#undef Error_Handler
+#endif
 void Error_Handler(void)
 {
     __disable_irq();
