@@ -126,7 +126,7 @@ UART RX 中断
 
 **1. 打开 Wokwi 新建项目**
 
-浏览器访问：https://wokwi.com/projects/new/stm32bluepill
+浏览器访问 https://wokwi.com ，点击 **"New Project"** → 选择 **"STM32 Nucleo-64 C031C6"**
 
 **2. 替换 `main.c`**
 
