@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# STM32CubeIDE / build artifacts
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+*.o
+*.su

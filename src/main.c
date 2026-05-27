@@ -28,12 +28,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 /* ===== 配置 ===== */
 #define CMD_BUF_SIZE     64
 #define RESP_BUF_SIZE    256
 #define LED_COUNT        3
 #define UART_BAUD        115200
+#define HISTORY_SIZE     8      /* 命令历史条数（环形缓冲区） */
+#define PROMPT_STR       "stm32> "
+#define PROMPT_LEN       7
 
 /* LED 工作模式 */
 typedef enum {
@@ -71,6 +75,15 @@ static uint32_t g_cmd_count = 0;
 static uint32_t g_cmd_err_count = 0;
 static uint32_t g_start_tick;
 
+/* ===== 命令历史（环形缓冲区） ===== */
+static char    g_history[HISTORY_SIZE][CMD_BUF_SIZE];
+static uint8_t g_hist_head  = 0;   /* 下次写入位置 */
+static uint8_t g_hist_count = 0;   /* 已保存条数 */
+static int8_t  g_hist_pos   = -1;  /* 浏览游标，-1 = 非历史模式 */
+
+/* ISR 内 VT100 ESC 序列状态机：0 正常 / 1 收到 ESC / 2 收到 ESC[ */
+static volatile uint8_t g_esc_state = 0;
+
 /* ===== 前向声明 ===== */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -90,6 +103,12 @@ static void cmd_pwm(int argc, char *argv[]);
 static void cmd_uptime(int argc, char *argv[]);
 static void cmd_reset(int argc, char *argv[]);
 static void cmd_stats(int argc, char *argv[]);
+static void cmd_history(int argc, char *argv[]);
+
+/* ===== 命令历史辅助函数 ===== */
+static void       history_push(const char *s, uint16_t len);
+static const char *history_get(int8_t offset);
+static void       isr_replace_line(const char *s, uint16_t len);
 
 /* 命令表（函数指针数组，可扩展） */
 typedef struct {
@@ -103,9 +122,10 @@ static const Command_t cmd_table[] = {
     { "led",    cmd_led,    "led <on|off|blink|status> <id> [param]" },
     { "pwm",    cmd_pwm,    "pwm <id> <duty 0-100>" },
     { "uptime", cmd_uptime, "Show system uptime" },
-    { "stats",  cmd_stats,  "Show command statistics" },
-    { "reset",  cmd_reset,  "Soft reset" },
-    { NULL,     NULL,       NULL }
+    { "stats",   cmd_stats,   "Show command statistics" },
+    { "history", cmd_history, "Show command history (or use ↑↓ arrows)" },
+    { "reset",   cmd_reset,   "Soft reset" },
+    { NULL,      NULL,        NULL }
 };
 
 /* ===== main ===== */
@@ -169,33 +189,92 @@ static void show_prompt(void)
     uart_print("stm32> ");
 }
 
-/* UART 中断回调：收一个字节就处理 */
+/* UART 中断回调：收一个字节就处理，支持 VT100 方向键历史浏览 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART1) {
-        uint8_t b = uart_rx_byte;
-        
-        if (b == '\r' || b == '\n') {
-            /* 命令结束 */
-            if (cmd_len > 0) {
-                cmd_buf[cmd_len] = '\0';
-                cmd_ready = 1;
-            }
-            HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 10);
-        } else if (b == 0x08 || b == 0x7F) {
-            /* 退格 */
-            if (cmd_len > 0) {
-                cmd_len--;
-                HAL_UART_Transmit(&huart1, (uint8_t *)"\b \b", 3, 10);
-            }
-        } else if (cmd_len < CMD_BUF_SIZE - 1 && b >= 0x20 && b < 0x7F) {
-            /* 可打印字符 */
-            cmd_buf[cmd_len++] = b;
-            HAL_UART_Transmit(&huart1, &b, 1, 10);  /* 回显 */
-        }
-        
+    if (huart->Instance != USART1) return;
+
+    /* 上一条命令尚未处理完，不写缓冲区 */
+    if (cmd_ready) {
         HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        return;
     }
+
+    uint8_t b = uart_rx_byte;
+
+    /* ---- VT100 ESC 序列状态机 ---- */
+    if (g_esc_state == 1) {
+        g_esc_state = (b == '[') ? 2 : 0;
+        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        return;
+    }
+    if (g_esc_state == 2) {
+        g_esc_state = 0;
+        if (b == 'A') {
+            /* ↑ 上箭头：往更早的历史移动 */
+            int8_t next = g_hist_pos + 1;
+            const char *h = history_get(next);
+            if (h) {
+                g_hist_pos = next;
+                uint16_t hlen = (uint16_t)strlen(h);
+                memcpy(cmd_buf, h, hlen + 1);
+                cmd_len = hlen;
+                isr_replace_line(h, hlen);
+            }
+        } else if (b == 'B') {
+            /* ↓ 下箭头：往更新的历史移动 */
+            int8_t next = g_hist_pos - 1;
+            g_hist_pos = next;
+            if (next < 0) {
+                /* 回到新输入 */
+                cmd_len = 0;
+                cmd_buf[0] = '\0';
+                isr_replace_line("", 0);
+            } else {
+                const char *h = history_get(next);
+                if (h) {
+                    uint16_t hlen = (uint16_t)strlen(h);
+                    memcpy(cmd_buf, h, hlen + 1);
+                    cmd_len = hlen;
+                    isr_replace_line(h, hlen);
+                }
+            }
+        }
+        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        return;
+    }
+
+    /* ---- 普通字符处理 ---- */
+    if (b == 0x1B) {
+        /* ESC 起始 */
+        g_esc_state = 1;
+    } else if (b == 0x03) {
+        /* Ctrl+C：清空当前输入 */
+        cmd_len = 0;
+        cmd_buf[0] = '\0';
+        g_hist_pos = -1;
+        HAL_UART_Transmit(&huart1, (uint8_t *)"^C\r\n" PROMPT_STR, 4 + PROMPT_LEN, 20);
+    } else if (b == '\r' || b == '\n') {
+        if (cmd_len > 0) {
+            cmd_buf[cmd_len] = '\0';
+            history_push(cmd_buf, cmd_len);
+            cmd_ready = 1;
+        }
+        HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 10);
+    } else if (b == 0x08 || b == 0x7F) {
+        /* 退格 */
+        if (cmd_len > 0) {
+            cmd_len--;
+            HAL_UART_Transmit(&huart1, (uint8_t *)"\b \b", 3, 10);
+        }
+    } else if (cmd_len < CMD_BUF_SIZE - 1 && b >= 0x20 && b < 0x7F) {
+        /* 可打印字符：退出历史浏览模式 */
+        g_hist_pos = -1;
+        cmd_buf[cmd_len++] = b;
+        HAL_UART_Transmit(&huart1, &b, 1, 10);
+    }
+
+    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 }
 
 /* ===== 命令处理 ===== */
@@ -366,12 +445,60 @@ static void cmd_reset(int argc, char *argv[])
     NVIC_SystemReset();
 }
 
+/* ===== 命令历史 ===== */
+
+/* 保存命令到历史环形缓冲区（在 ISR 中调用） */
+static void history_push(const char *s, uint16_t len)
+{
+    if (len == 0) return;
+    memcpy(g_history[g_hist_head], s, len + 1);
+    g_hist_head = (g_hist_head + 1) % HISTORY_SIZE;
+    if (g_hist_count < HISTORY_SIZE) g_hist_count++;
+    g_hist_pos = -1;
+}
+
+/* 获取历史条目（offset=0 最近，offset=1 更早）；在 ISR 或 main 中均可调用 */
+static const char *history_get(int8_t offset)
+{
+    if (offset < 0 || offset >= (int8_t)g_hist_count) return NULL;
+    uint8_t idx = (g_hist_head - 1 - (uint8_t)offset + HISTORY_SIZE * 2) % HISTORY_SIZE;
+    return g_history[idx];
+}
+
+/* 在 ISR 中：用 VT100 清除当前行并重新显示提示符 + 新内容 */
+static void isr_replace_line(const char *s, uint16_t len)
+{
+    /* \r 回到行首，\x1b[2K 擦除整行，然后重新打印提示符 */
+    HAL_UART_Transmit(&huart1, (uint8_t *)"\r\x1b[2K" PROMPT_STR, 5 + PROMPT_LEN, 20);
+    if (len > 0) {
+        HAL_UART_Transmit(&huart1, (uint8_t *)s, len, 50);
+    }
+}
+
+static void cmd_history(int argc, char *argv[])
+{
+    /* 关中断快速读取游标，防止 ISR 并发修改 */
+    __disable_irq();
+    uint8_t cnt  = g_hist_count;
+    uint8_t head = g_hist_head;
+    __enable_irq();
+
+    if (cnt == 0) {
+        uart_print("  (no history)\r\n");
+        return;
+    }
+    for (int8_t i = (int8_t)cnt - 1; i >= 0; i--) {
+        uint8_t idx = (head - 1 - (uint8_t)i + HISTORY_SIZE * 2) % HISTORY_SIZE;
+        uart_print("  %3d  %s\r\n", (int)(cnt - 1 - (uint8_t)i), g_history[idx]);
+    }
+}
+
 /* ===== LED 控制 ===== */
 
 static void led_set(uint8_t id, uint8_t on)
 {
     if (id >= LED_COUNT) return;
-    GPIO_PinState state = on ^ g_leds[id].active_low ? GPIO_PIN_SET : GPIO_PIN_RESET;
+    GPIO_PinState state = (on ^ g_leds[id].active_low) ? GPIO_PIN_SET : GPIO_PIN_RESET;
     HAL_GPIO_WritePin(g_leds[id].port, g_leds[id].pin, state);
 }
 
