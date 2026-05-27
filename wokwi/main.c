@@ -512,12 +512,4 @@ static void MX_TIM1_Init(void)
     HAL_TIM_MspPostInit(&htim1);
 }
 
-/* ===== Error_Handler（先取消框架宏定义，再声明我们的版本） ===== */
-#ifdef Error_Handler
-#undef Error_Handler
-#endif
-void Error_Handler(void)
-{
-    __disable_irq();
-    while (1) { }
-}
+/* Error_Handler 由 Arduino STM32 框架（stm32_def.h）以宏形式提供，此处不重复定义 */
