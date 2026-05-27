@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "author": "rikai",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-stm32-bluepill",
+      "id": "cpu",
+      "top": 80,
+      "left": 0,
+      "attrs": { "env": "arduino-cmsis-hal" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 32,
+      "left": 270,
+      "rotate": 90,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led2",
+      "top": 0,
+      "left": 300,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r2",
+      "top": 112,
+      "left": 270,
+      "rotate": 90,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led3",
+      "top": 80,
+      "left": 300,
+      "attrs": { "color": "blue" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r3",
+      "top": 192,
+      "left": 270,
+      "rotate": 90,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_pwm",
+      "top": 160,
+      "left": 300,
+      "attrs": { "color": "yellow" }
+    }
+  ],
+  "connections": [
+    ["cpu:PB0",  "r1:1", "green",  ["h10"]],
+    ["r1:2",     "led2:A", "green", ["h0"]],
+    ["led2:C",   "cpu:GND.2", "black", ["h0", "v80", "h-280"]],
+
+    ["cpu:PB1",  "r2:1", "blue",   ["h10"]],
+    ["r2:2",     "led3:A", "blue",  ["h0"]],
+    ["led3:C",   "cpu:GND.2", "black", ["h0", "v0"]],
+
+    ["cpu:PA8",  "r3:1", "orange", ["h10"]],
+    ["r3:2",     "led_pwm:A", "orange", ["h0"]],
+    ["led_pwm:C","cpu:GND.2", "black", ["h0", "v-80", "h-280"]]
+  ],
+  "serialMonitor": {
+    "display": "terminal",
+    "newline": "lf"
+  }
+}
