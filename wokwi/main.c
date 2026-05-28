@@ -1,9 +1,13 @@
 /**
  * @file    main.c  (Wokwi — STM32 Nucleo-64 C031C6, Arduino 框架)
+ * @version 1.1
  *
- * 使用方法：
- *   1. Wokwi 选 C031C6 新建项目，粘贴 main.c + diagram.json，点 ▶ 运行
- *   2. 右侧 Serial Monitor 输入命令（如 help、led on 1、pwm 1 75）
+ * 功能：
+ *   - 8 条 CLI 命令（help / led / pwm / uptime / sysinfo / stats / history / reset）
+ *   - LED 状态机：on / off / blink（可配置周期，非阻塞）
+ *   - PWM 渐变状态机（呼吸灯）：pwm fade <step> <ms>，非阻塞，不干扰串口
+ *   - VT100 命令历史：↑↓ 方向键翻 8 条历史，Ctrl+C 清行
+ *   - sysinfo：实时显示 MCU 型号 / 时钟 / 引脚图 / 固件版本 / 运行时状态
  *
  * 为什么不用裸 HAL？
  *   Wokwi C031C6 使用 Arduino STM32 框架编译，SrcWrapper 库已定义了
@@ -16,11 +20,11 @@
  *   命令解析、LED 状态机、历史记录等核心逻辑完全不变。
  *
  * 引脚：
- *   PA5  - LED1 板载 LD2       led on/off/blink 1
- *   PB0  - LED2 绿色           led on/off/blink 2
- *   PB1  - LED3 蓝色           led on/off/blink 3
- *   PA8  - PWM 输出（黄色LED） pwm 1 <0-100>
  *   PA2/PA3 - Serial Monitor（diagram.json 已连线）
+ *   PA5     - LED1 板载 LD2            led on/off/blink 1
+ *   PA8     - PWM 输出（黄色LED）      pwm 1 <0-100> | pwm fade <step> <ms>
+ *   PB0     - LED2 绿色                led on/off/blink 2
+ *   PB1     - LED3 蓝色                led on/off/blink 3
  */
 
 #include <stdarg.h>
@@ -66,6 +70,18 @@ static uint8_t g_hist_count = 0;
 static int8_t  g_hist_pos   = -1;
 static uint8_t g_esc_state  = 0;
 
+/* ===== PWM 渐变状态机 ===== */
+typedef struct {
+    uint8_t  active;       /* 1 = 正在渐变 */
+    int8_t   direction;    /* +1=亮 -1=暗 */
+    uint8_t  step;         /* 每次步进 duty% */
+    uint32_t interval_ms;  /* 步进间隔 ms */
+    uint32_t next_ms;      /* 下次变化时间 */
+    int16_t  current;      /* 当前 duty (0-100) */
+} PwmFade_t;
+
+static PwmFade_t g_fade = { 0 };
+
 /* ===== 前向声明 ===== */
 static void uart_print(const char *fmt, ...);
 static void show_prompt(void);
@@ -73,6 +89,7 @@ static void handle_byte(uint8_t b);
 static void process_command(char *cmd);
 static void led_set(uint8_t id, uint8_t on);
 static void update_leds(void);
+static void update_pwm_fade(void);
 static void cmd_help(int argc, char *argv[]);
 static void cmd_led(int argc, char *argv[]);
 static void cmd_pwm(int argc, char *argv[]);
@@ -80,6 +97,7 @@ static void cmd_uptime(int argc, char *argv[]);
 static void cmd_reset(int argc, char *argv[]);
 static void cmd_stats(int argc, char *argv[]);
 static void cmd_history_cmd(int argc, char *argv[]);
+static void cmd_sysinfo(int argc, char *argv[]);
 static void       history_push(const char *s, uint16_t len);
 static const char *history_get(int8_t offset);
 static void       replace_line(const char *s, uint16_t len);
@@ -93,8 +111,9 @@ typedef struct {
 static const Command_t cmd_table[] = {
     { "help",    cmd_help,        "Show all commands" },
     { "led",     cmd_led,         "led <on|off|blink|status> <id> [ms]" },
-    { "pwm",     cmd_pwm,         "pwm <id> <duty 0-100>" },
+    { "pwm",     cmd_pwm,         "pwm <id> <duty 0-100> | pwm fade <step> <ms> | pwm stop" },
     { "uptime",  cmd_uptime,      "Show system uptime" },
+    { "sysinfo", cmd_sysinfo,     "Show MCU info and pin map" },
     { "stats",   cmd_stats,       "Show command statistics" },
     { "history", cmd_history_cmd, "Show command history (up/down arrows)" },
     { "reset",   cmd_reset,       "Soft reset" },
@@ -115,7 +134,7 @@ void setup(void)
 
     uart_print("\r\n");
     uart_print("=====================================\r\n");
-    uart_print(" STM32 Command Line Controller v1.0\r\n");
+    uart_print(" STM32 Command Line Controller v1.1\r\n");
     uart_print(" Type 'help' for command list\r\n");
     uart_print("=====================================\r\n");
     show_prompt();
@@ -136,6 +155,7 @@ void loop(void)
     }
 
     update_leds();
+    update_pwm_fade();
 }
 
 /* ===== UART 工具（封装 Arduino Serial） ===== */
@@ -295,13 +315,49 @@ static void cmd_led(int argc, char *argv[])
 
 static void cmd_pwm(int argc, char *argv[])
 {
+    if (argc < 2) {
+        uart_print("Usage: pwm <id> <duty 0-100>\r\n");
+        uart_print("       pwm fade <step 1-20> <interval_ms>\r\n");
+        uart_print("       pwm stop\r\n");
+        return;
+    }
+
+    /* pwm fade <step> <interval_ms> — 启动非阻塞呼吸灯渐变 */
+    if (strcmp(argv[1], "fade") == 0) {
+        if (argc < 4) {
+            uart_print("Usage: pwm fade <step 1-20> <interval_ms 10-2000>\r\n");
+            return;
+        }
+        int step = atoi(argv[2]);
+        int ms   = atoi(argv[3]);
+        if (step < 1 || step > 20) { uart_print("Error: step must be 1-20\r\n");       return; }
+        if (ms < 10 || ms > 2000)  { uart_print("Error: interval must be 10-2000 ms\r\n"); return; }
+        g_fade.step        = (uint8_t)step;
+        g_fade.interval_ms = (uint32_t)ms;
+        g_fade.direction   = +1;
+        g_fade.current     = 0;
+        g_fade.next_ms     = millis() + (uint32_t)ms;
+        g_fade.active      = 1;
+        uart_print("PWM fade ON: step=%d%% every %d ms  (0->100->0 loop)\r\n", step, ms);
+        return;
+    }
+
+    /* pwm stop — 停止渐变，关闭输出 */
+    if (strcmp(argv[1], "stop") == 0) {
+        g_fade.active = 0;
+        analogWrite(PA8, 0);
+        uart_print("PWM fade stopped, PA8 = 0%%\r\n");
+        return;
+    }
+
+    /* pwm <id> <duty> — 设置固定占空比（同时停止渐变） */
     if (argc < 3) { uart_print("Usage: pwm <id> <duty 0-100>\r\n"); return; }
     int id = atoi(argv[1]), duty = atoi(argv[2]);
-    if (id != 1)           { uart_print("Error: only PWM 1 is supported\r\n"); return; }
-    if (duty < 0 || duty > 100) { uart_print("Error: duty must be 0-100\r\n"); return; }
-    /* analogWrite 范围 0-255，换算占空比 */
-    analogWrite(PA8, (int)(duty * 255 / 100));
-    uart_print("PWM%d duty = %d%%\r\n", id, duty);
+    if (id != 1)                 { uart_print("Error: only PWM id 1 (PA8) supported\r\n"); return; }
+    if (duty < 0 || duty > 100)  { uart_print("Error: duty must be 0-100\r\n");            return; }
+    g_fade.active = 0;                              /* 固定占空比时关闭渐变 */
+    analogWrite(PA8, (int)(duty * 255 / 100));      /* analogWrite 范围 0-255 */
+    uart_print("PWM1 (PA8) duty = %d%%\r\n", duty);
 }
 
 static void cmd_uptime(int argc, char *argv[])
@@ -376,4 +432,64 @@ static void update_leds(void)
             g_leds[i].next_toggle = now + g_leds[i].blink_period_ms;
         }
     }
+}
+
+/* ===== PWM 渐变状态机（非阻塞，在 loop() 中调用） =====
+ *
+ * 原理：每隔 interval_ms 毫秒将 PA8 占空比增加或减少 step%。
+ * 到达 100% 时方向反转（开始减暗），到达 0% 时再次反转，
+ * 形成连续的"呼吸灯"效果——无 delay()，不阻塞串口接收。
+ */
+static void update_pwm_fade(void)
+{
+    if (!g_fade.active) return;
+
+    uint32_t now = millis();
+    if (now < g_fade.next_ms) return;          /* 未到步进时刻，直接返回 */
+
+    g_fade.next_ms = now + g_fade.interval_ms;
+    g_fade.current += g_fade.direction * (int16_t)g_fade.step;
+
+    if (g_fade.current >= 100) {
+        g_fade.current   = 100;
+        g_fade.direction = -1;                 /* 顶端：转为减暗 */
+    } else if (g_fade.current <= 0) {
+        g_fade.current   = 0;
+        g_fade.direction = +1;                 /* 底端：转为加亮 */
+    }
+
+    analogWrite(PA8, (int)(g_fade.current * 255 / 100));
+}
+
+/* ===== sysinfo 命令：显示 MCU 参数、引脚图、固件版本 ===== */
+static void cmd_sysinfo(int argc, char *argv[])
+{
+    uint32_t ms   = millis() - g_start_tick;
+    uint32_t upss = ms / 1000;
+
+    uart_print("=== System Information ===\r\n");
+    uart_print("  MCU       : STM32C031C6  (Cortex-M0+)\r\n");
+    uart_print("  Clock     : 48 MHz  (HSI, no PLL)\r\n");
+    uart_print("  Flash     : 32 KB    RAM: 12 KB\r\n");
+    uart_print("  Framework : Arduino STM32 (SrcWrapper)\r\n");
+    uart_print("  Firmware  : CLI-Controller v1.1\r\n");
+    uart_print("  Build     : " __DATE__ " " __TIME__ "\r\n");
+    uart_print("\r\n");
+    uart_print("=== Pin Map ===\r\n");
+    uart_print("  PA2  TX   -> Serial Monitor (115200 baud)\r\n");
+    uart_print("  PA3  RX   -> Serial Monitor\r\n");
+    uart_print("  PA5  OUT  -> LED1 (board LD2, active-high)\r\n");
+    uart_print("  PA8  PWM  -> LED4 yellow  [pwm 1 <duty>]\r\n");
+    uart_print("  PB0  OUT  -> LED2 green\r\n");
+    uart_print("  PB1  OUT  -> LED3 blue\r\n");
+    uart_print("\r\n");
+    uart_print("=== Runtime ===\r\n");
+    uart_print("  Uptime    : %lu:%02lu:%02lu\r\n",
+               upss / 3600, (upss / 60) % 60, upss % 60);
+    uart_print("  Tick      : %lu ms\r\n", ms);
+    uart_print("  PWM fade  : %s", g_fade.active ? "RUNNING" : "idle");
+    if (g_fade.active)
+        uart_print("  duty=%d%%  step=%d%%  interval=%lu ms",
+                   (int)g_fade.current, (int)g_fade.step, g_fade.interval_ms);
+    uart_print("\r\n");
 }

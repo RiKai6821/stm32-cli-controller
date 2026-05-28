@@ -1,84 +1,153 @@
 # STM32 串口命令行控制器
 
-> 一个运行在 STM32F103 上的命令行交互系统，通过串口实现类 Linux Shell 的命令交互，控制板上 LED、PWM 等外设。
-
-## 项目简介
-
-本项目实现了一个轻量级的嵌入式命令行系统。用户通过串口终端输入命令，STM32 解析后控制硬件。整个系统采用**可扩展的命令表 + 函数指针**架构，新增命令只需在命令表添加一行。
+> 运行在 STM32C031C6（Cortex-M0+，48 MHz）上的轻量级嵌入式 CLI 系统。通过串口实现类 Shell 的人机交互，兼具工程实用性与代码可读性：命令表驱动、非阻塞状态机、VT100 终端协议解析，以及运行时自检诊断。
 
 ## 功能特性
 
-- ✅ 类 Shell 交互体验：回显、退格、命令提示符
-- ✅ 基于函数指针的命令分发机制（易扩展）
-- ✅ 简洁高效的命令解析器（不依赖 strtok）
-- ✅ 多 LED 独立控制（开关 / 闪烁，闪烁周期可调）
-- ✅ PWM 占空比动态调节
-- ✅ 系统运行时间、命令统计
-- ✅ 完善的参数检查与错误提示
-- ✅ 可在 Wokwi STM32 模拟器上验证
+| 技术点 | 实现 |
+|--------|------|
+| 命令分发 | 函数指针表（Open/Closed 原则）—— 新增命令只加一行 |
+| 非阻塞 LED 闪烁 | 状态机 + `millis()` 时基，零 `delay()`，不影响串口 |
+| 非阻塞 PWM 渐变 | 呼吸灯状态机，`pwm fade <step> <ms>` 启动 / `pwm stop` 停止 |
+| VT100 终端协议 | ESC `[A`/`[B` 识别方向键，翻阅 8 条命令历史 |
+| 命令历史 | 环形缓冲区，`↑↓` 翻历史，`Ctrl+C` 清行 |
+| 系统诊断 | `sysinfo` 实时输出 MCU 型号 / 时钟 / 引脚图 / PWM 状态 |
+| 统计监控 | `stats` 显示命令总数、错误率，便于测试阶段观测稳定性 |
+| 参数校验 | 每条命令做完整边界检查，返回明确错误提示 |
 
-## 支持命令
-
-| 命令 | 说明 | 示例 |
-|------|------|------|
-| `help` | 显示帮助 | `help` |
-| `led on <id>` | 打开指定 LED | `led on 1` |
-| `led off <id>` | 关闭指定 LED | `led off 2` |
-| `led blink <id> <ms>` | LED 周期闪烁 | `led blink 1 500` |
-| `led status` | 显示所有 LED 状态 | `led status` |
-| `pwm <id> <duty>` | 设置 PWM 占空比 | `pwm 1 50` |
-| `uptime` | 显示运行时间 | `uptime` |
-| `stats` | 显示命令统计 | `stats` |
-| `reset` | 软复位 | `reset` |
-
-## 交互示例
+## 命令参考
 
 ```
-=====================================
- STM32 Command Line Controller v1.0
- Type 'help' for command list
-=====================================
 stm32> help
 Available commands:
   help     - Show all commands
-  led      - led <on|off|blink|status> <id> [param]
-  pwm      - pwm <id> <duty 0-100>
+  led      - led <on|off|blink|status> <id> [ms]
+  pwm      - pwm <id> <duty 0-100> | pwm fade <step> <ms> | pwm stop
   uptime   - Show system uptime
+  sysinfo  - Show MCU info and pin map
   stats    - Show command statistics
+  history  - Show command history (up/down arrows)
   reset    - Soft reset
+```
+
+### 命令示例
+
+```bash
+# LED 控制
+led on 1                 # 点亮 LED1（PA5 板载 LD2）
+led blink 2 300          # LED2 以 300 ms 周期闪烁（非阻塞）
+led status               # 查看所有 LED 当前模式
+
+# PWM 控制
+pwm 1 75                 # 设置 PA8 占空比 75%（固定）
+pwm fade 5 20            # 启动呼吸灯：每 20 ms 步进 5%（0→100→0 循环）
+pwm stop                 # 停止渐变，PA8 输出归零
+
+# 系统信息
+sysinfo                  # 显示 MCU 型号、时钟、引脚图、PWM 实时状态
+uptime                   # 运行时间（精确到毫秒）
+stats                    # 命令处理数 / 错误率
+```
+
+## 交互演示
+
+```
+=====================================
+ STM32 Command Line Controller v1.1
+ Type 'help' for command list
+=====================================
+stm32> sysinfo
+=== System Information ===
+  MCU       : STM32C031C6  (Cortex-M0+)
+  Clock     : 48 MHz  (HSI, no PLL)
+  Flash     : 32 KB    RAM: 12 KB
+  Framework : Arduino STM32 (SrcWrapper)
+  Firmware  : CLI-Controller v1.1
+  Build     : May 28 2026 10:34:17
+
+=== Pin Map ===
+  PA2  TX   -> Serial Monitor (115200 baud)
+  PA3  RX   -> Serial Monitor
+  PA5  OUT  -> LED1 (board LD2, active-high)
+  PA8  PWM  -> LED4 yellow  [pwm 1 <duty>]
+  PB0  OUT  -> LED2 green
+  PB1  OUT  -> LED3 blue
+
+=== Runtime ===
+  Uptime    : 0:02:14
+  Tick      : 134021 ms
+  PWM fade  : RUNNING  duty=63%  step=5%  interval=20 ms
 
 stm32> led blink 1 200
 LED1 BLINK 200 ms
 
-stm32> pwm 1 75
-PWM1 duty = 75%
-
-stm32> uptime
-Uptime: 42.158 s  (0:00:42)
+stm32> pwm fade 5 20
+PWM fade ON: step=5% every 20 ms  (0->100->0 loop)
 
 stm32> stats
 System statistics:
-  Commands processed: 5
+  Commands processed: 8
   Command errors:     0
   Success rate:       100%
 ```
 
-## 硬件要求
+> **提示**：串口终端支持 `↑↓` 方向键翻阅历史命令、`Backspace` 退格、`Ctrl+C` 清行——VT100 ESC 序列由固件解析，体验接近真实 shell。
 
-| 引脚 | 功能 |
-|------|------|
-| PC13 | LED1（板载，低电平点亮） |
-| PB0  | LED2 |
-| PB1  | LED3 |
-| PA8  | TIM1_CH1 PWM 输出 |
-| PA9  | USART1_TX |
-| PA10 | USART1_RX |
+## 技术要点
 
-也可以**直接在 Wokwi 上跑**，无需硬件：https://wokwi.com/projects/new/stm32
+### 1. 非阻塞呼吸灯状态机
 
-## 软件架构
+许多教程用 `delay()` 实现渐变——这会阻塞整个 MCU，串口在渐变期间完全失去响应。  
+本项目使用状态机 + 时间戳，`loop()` 每帧仅判断"是否到达步进时刻"，不做任何等待：
 
-### 命令表机制
+```c
+typedef struct {
+    uint8_t  active;       /* 1 = 正在渐变        */
+    int8_t   direction;    /* +1=加亮  -1=减暗    */
+    uint8_t  step;         /* 每步 duty 变化量    */
+    uint32_t interval_ms;  /* 步进间隔 ms         */
+    uint32_t next_ms;      /* 下次步进的绝对时刻  */
+    int16_t  current;      /* 当前 duty (0-100)   */
+} PwmFade_t;
+
+static void update_pwm_fade(void)
+{
+    if (!g_fade.active) return;
+    uint32_t now = millis();
+    if (now < g_fade.next_ms) return;          // 未到时刻，立即退出
+
+    g_fade.next_ms = now + g_fade.interval_ms;
+    g_fade.current += g_fade.direction * (int16_t)g_fade.step;
+
+    if      (g_fade.current >= 100) { g_fade.current = 100; g_fade.direction = -1; }
+    else if (g_fade.current <= 0)   { g_fade.current = 0;   g_fade.direction = +1; }
+
+    analogWrite(PA8, (int)(g_fade.current * 255 / 100));
+}
+```
+
+同样的思路适用于所有"定时触发但不能阻塞"的场景（传感器采样、喂狗、心跳帧）。
+
+### 2. VT100 终端协议解析
+
+串口按字节到达，方向键实际上是三字节 ESC 序列：`0x1B 0x5B 0x41`（↑）。  
+用一个两位 ESC 状态机识别，无额外内存开销：
+
+```c
+if (g_esc_state == 1) {
+    g_esc_state = (b == '[') ? 2 : 0;  // 等待 '['
+    return;
+}
+if (g_esc_state == 2) {
+    g_esc_state = 0;
+    if      (b == 'A') /* ↑ 上翻历史 */ ;
+    else if (b == 'B') /* ↓ 下翻历史 */ ;
+    return;
+}
+if (b == 0x1B) { g_esc_state = 1; }
+```
+
+### 3. 命令表 + 函数指针（Open/Closed 原则）
 
 ```c
 typedef struct {
@@ -88,126 +157,91 @@ typedef struct {
 } Command_t;
 
 static const Command_t cmd_table[] = {
-    { "led", cmd_led, "..." },
-    { "pwm", cmd_pwm, "..." },
-    ...
+    { "help",    cmd_help,        "Show all commands"           },
+    { "led",     cmd_led,         "led <on|off|blink|status> …" },
+    { "pwm",     cmd_pwm,         "pwm <id> <duty> | fade | stop" },
+    { "uptime",  cmd_uptime,      "Show system uptime"          },
+    { "sysinfo", cmd_sysinfo,     "Show MCU info and pin map"   },
+    { "stats",   cmd_stats,       "Show command statistics"     },
+    { "history", cmd_history_cmd, "Show command history"        },
+    { "reset",   cmd_reset,       "Soft reset"                  },
+    { NULL, NULL, NULL }
 };
 ```
 
-新增命令只需：
-1. 实现 `cmd_xxx(int argc, char *argv[])` 函数
-2. 在 `cmd_table` 中加一行
+新增命令 = 实现一个 `cmd_xxx()` + 在表里加一行。解析器代码零修改，符合 **OCP**。
 
-不需要修改解析器，**符合开闭原则**。
-
-### 命令处理流程
+### 4. 命令历史环形缓冲区
 
 ```
-UART RX 中断
-    ↓ (每字节)
-缓冲到 cmd_buf，遇 \r\n 标记 cmd_ready
-    ↓
-主循环检测 cmd_ready
-    ↓
-分词 → 查命令表 → 调用 handler
-    ↓
-输出结果，重新显示提示符
+g_history[8][64]   ← 最近 8 条命令的环形缓冲
+g_hist_head        ← 写指针（模 8 循环）
+g_hist_pos         ← 当前翻阅偏移（-1 = 未翻阅）
 ```
 
-### 为什么用查表 + 函数指针？
+按 ↑ 时 `offset++`，按 ↓ 时 `offset--`，`history_get(offset)` 通过偏移量计算真实数组下标，无需搬移数据。
 
-如果用 `if-else` 链分发命令，每加一条命令就要修改一处。命令表是**典型的"数据驱动"设计**，把"什么命令做什么"变成了静态数据，代码逻辑保持不变。这是工业代码常用的模式。
-
-## 快速上手：Wokwi 在线仿真（无需硬件）
-
-`wokwi/` 目录中提供了完整的独立仿真版本，在浏览器里就能跑，0 分钟上手。
-
-### 步骤
+## Wokwi 在线仿真（无需硬件，0 分钟上手）
 
 **1. 打开 Wokwi 新建项目**
 
-浏览器访问 https://wokwi.com ，点击 **"New Project"** → 选择 **"STM32 Nucleo-64 C031C6"**
+浏览器访问 https://wokwi.com → **New Project** → **STM32 Nucleo-64 C031C6**
 
-**2. 替换 `main.c`**
+**2. 替换两个文件**
 
-- 在 Wokwi 编辑器左侧点击 `main.c` 标签
-- 全选（Ctrl+A）并删除默认内容
-- 打开本仓库 [`wokwi/main.c`](wokwi/main.c)，复制全部内容粘贴进去
+| 文件 | 内容来源 |
+|------|---------|
+| `main.c` | 本仓库 [`wokwi/main.c`](wokwi/main.c) |
+| `diagram.json` | 本仓库 [`wokwi/diagram.json`](wokwi/diagram.json) |
 
-**3. 替换 `diagram.json`**
+**3. 启动仿真**
 
-- 在 Wokwi 编辑器中点击 `diagram.json` 标签
-- 同样全选删除，然后粘贴 [`wokwi/diagram.json`](wokwi/diagram.json) 的内容
+点击 **▶** 按钮，等待编译（约 5–10 秒），右侧 **Serial Monitor** 出现提示符后即可输入命令。
 
-**4. 启动仿真**
+### 推荐测试序列
 
-点击编辑器顶部绿色的 **▶ 播放** 按钮，等待 2~3 秒编译完成。
-
-**5. 打开串口监视器**
-
-点击右侧 **"Serial Monitor"** 面板（或底部的终端图标），然后输入命令：
-
-```
-help
-led on 1
-led blink 2 300
-pwm 1 75
-uptime
-stats
+```bash
+sysinfo                  # 查看 MCU 信息
+led blink 1 200          # LED1 以 200 ms 闪烁
+led blink 2 700          # LED2 以 700 ms 闪烁（两灯异步，互不干扰）
+pwm fade 5 20            # 启动呼吸灯（此时 LED 闪烁仍正常——验证非阻塞）
+uptime                   # 查看运行时间
+stats                    # 查看命令统计
+pwm stop                 # 停止呼吸灯
+led off 1                # 关闭 LED1
+history                  # 查看历史记录
 ```
 
-### 仿真效果预览
+### 电路连接（diagram.json 已配置）
 
-```
-=====================================
- STM32 Command Line Controller v1.0
- Type 'help' for command list
-=====================================
-stm32> help
-Available commands:
-  help     - Show all commands
-  led      - led <on|off|blink|status> <id> [param]
-  pwm      - pwm <id> <duty 0-100>
-  uptime   - Show system uptime
-  stats    - Show command statistics
-  history  - Show command history (or use up/down arrows)
-  reset    - Soft reset
-
-stm32> led blink 2 300
-LED2 BLINK 300 ms
-
-stm32> pwm 1 75
-PWM1 duty = 75%
-
-stm32> uptime
-Uptime: 12.043 s  (0:00:12)
-```
-
-> **提示**：Wokwi 终端支持方向键翻历史命令（↑↓）、Backspace 退格、Ctrl+C 清行，与真实串口终端体验一致。
-
-### 电路说明
-
-| 组件 | 引脚 | 说明 |
+| 组件 | 引脚 | 命令 |
 |------|------|------|
-| 板载 LED (PC13) | PC13 | 低电平点亮，`led on 1` 控制 |
-| 绿色 LED (PB0) | PB0 → 220Ω | `led on 2` / `led blink 2 <ms>` |
-| 蓝色 LED (PB1) | PB1 → 220Ω | `led on 3` / `led blink 3 <ms>` |
-| 黄色 LED (PA8) | PA8 → 220Ω | PWM 亮度，`pwm 1 <0-100>` 调节 |
+| 板载 LD2 | PA5（高有效） | `led on/off/blink 1` |
+| 绿色 LED | PB0 → 220Ω → GND | `led on/off/blink 2` |
+| 蓝色 LED | PB1 → 220Ω → GND | `led on/off/blink 3` |
+| 黄色 LED | PA8 → 220Ω → GND | `pwm 1 <0-100>` / `pwm fade` |
 
----
+## 项目结构
 
-## 在真实硬件上运行
+```
+stm32-cli-controller/
+├── wokwi/
+│   ├── main.c           # 完整独立版（Arduino STM32 框架，可直接 Wokwi 运行）
+│   └── diagram.json     # Wokwi 电路定义
+├── src/
+│   └── main.c           # 裸 HAL 版本（STM32F103，配合 CubeIDE 使用）
+└── README.md
+```
 
-### 方式：STM32CubeIDE + Blue Pill
+## 在真实硬件上运行（STM32F103 Blue Pill）
 
-1. 新建 STM32CubeIDE 项目，芯片 **STM32F103C8Tx**
+1. STM32CubeIDE 新建项目，芯片 **STM32F103C8Tx**
 2. CubeMX 配置：
-   - PC13 / PB0 / PB1：GPIO Output
-   - PA8：TIM1_CH1 PWM Generation
-   - TIM1：Prescaler = 71，Period = 999（1 kHz PWM）
-   - USART1：115200 8N1，Enable RX Interrupt
-3. 将 `src/main.c` 的逻辑整合进 CubeIDE 生成的 `main.c`（或直接用 `wokwi/main.c`，它包含完整初始化）
-4. 编译烧录，用串口工具连接：
+   - `PC13 / PB0 / PB1`：GPIO Output
+   - `PA8`：TIM1_CH1 PWM Generation，PSC=71，Period=999（1 kHz）
+   - `USART1`：115200 8N1，使能 RX 中断
+3. 将 `src/main.c` 的命令逻辑整合进 CubeIDE 工程（或直接修改 `wokwi/main.c` 替换 Arduino API 为 HAL 调用）
+4. 烧录后用终端工具连接：
 
 ```bash
 # macOS
@@ -218,39 +252,6 @@ minicom -D /dev/ttyUSB0 -b 115200
 
 # Windows：PuTTY → Serial → COMx → 115200
 ```
-
-## 项目结构
-
-```
-stm32-cli-controller/
-├── src/
-│   └── main.c           # 业务逻辑（依赖 CubeMX 生成文件）
-├── wokwi/
-│   ├── main.c           # 独立完整版，可直接在 Wokwi 运行
-│   └── diagram.json     # Wokwi 电路定义
-├── docs/
-│   └── architecture.md
-└── README.md
-```
-
-## 代码统计
-
-约 400 行 C 代码，包含完整命令解析、LED 状态机、PWM 控制、系统统计。
-
-## 技术要点
-
-1. **环形缓冲区思想**：UART 接收用单字节中断 + 缓冲区，主循环处理，**中断快进快出**
-2. **状态机思想**：LED 闪烁不用阻塞 delay，主循环根据当前 tick 判断是否翻转
-3. **可扩展架构**：命令表设计让新功能添加成本极低
-4. **错误处理完整**：每个命令都做参数边界检查，统计错误率
-
-## 学到了什么
-
-- UART 中断接收的正确写法（不阻塞主循环）
-- 函数指针 + 表驱动设计模式
-- 简单命令行解析器的实现
-- 用 `HAL_GetTick()` 实现非阻塞定时
-- C 语言可变参数 (`vsnprintf`) 用法
 
 ## 许可证
 
